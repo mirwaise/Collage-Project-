@@ -1,0 +1,505 @@
+# ==========================================
+# 1. IMPORTS
+# ==========================================
+
+# Standard Library Imports
+import os
+import json
+import secrets
+import base64
+import pickle
+import random
+import time
+import binascii
+from datetime import date, datetime
+from hashlib import sha256
+
+# Django Imports
+from django.shortcuts import render
+from django.template import RequestContext
+from django.contrib import messages
+from django.http import HttpResponse
+from django.core.files.storage import FileSystemStorage
+from django.urls import path
+
+# Third-Party / Scientific Imports
+import numpy as np
+import pyaes
+import pbkdf2
+from web3 import Web3, HTTPProvider
+
+# ==========================================
+# 2. GLOBAL CONFIGURATION & VARIABLES
+# ==========================================
+
+# Blockchain Connection Details
+BLOCKCHAIN_URL = 'http://127.0.0.1:7545' # Ganache/Anvil URL
+CONTRACT_ADDRESS = '0xd374Cb05bd6187D6cF905D7bBD85f2b704fBDD29' # Address where contract is deployed
+CONTRACT_ABI_PATH = 'TenderContract.json' # The ABI file
+
+# Global State Variables (Used to hold data in memory)
+global contract, web3, tenderList, username
+tenderList = []
+username = None
+
+# ==========================================
+# 3. HELPER FUNCTIONS (Blockchain & Security)
+# ==========================================
+
+def getContract():
+    """
+    Connects to the Ethereum blockchain using Web3.py.
+    Loads the smart contract ABI and address to allow interaction.
+    """
+    global contract, web3
+    
+    # Connect to the local blockchain node
+    web3 = Web3(HTTPProvider(BLOCKCHAIN_URL))
+    web3.eth.defaultAccount = web3.eth.accounts[0]
+    
+    # Load the Smart Contract ABI
+    with open(CONTRACT_ABI_PATH) as file:
+        contract_json = json.load(file)
+        contract_abi = contract_json['abi']
+    
+    # Create the contract instance
+    contract = web3.eth.contract(address=CONTRACT_ADDRESS, abi=contract_abi)
+
+# Initialize the contract connection immediately
+getContract()
+
+def getKey():
+    """
+    Generates a secure 32-byte encryption key using PBKDF2.
+    This simulates a shared secret or password-based key derivation.
+    """
+    password = "s3cr3t*c0d3"
+    passwordSalt = "0986543" 
+    # Derive key: Password + Salt -> 32 byte key
+    key = pbkdf2.PBKDF2(password, passwordSalt).read(32)
+    return key
+
+def encrypt(plaintext):
+    """
+    Encrypts data using AES-256 in CTR (Counter) mode.
+    This ensures bid privacy before data is sent to the blockchain.
+    """
+    # Initialize AES with a specific Counter (IV)
+    iv_counter = pyaes.Counter(31129547035000047302952433967654195398124239844566322884172163637846056248223)
+    aes = pyaes.AESModeOfOperationCTR(getKey(), iv_counter)
+    
+    ciphertext = aes.encrypt(plaintext)
+    return ciphertext
+
+def decrypt(enc):
+    """
+    Decrypts the AES-256 encrypted data coming from the blockchain.
+    """
+    iv_counter = pyaes.Counter(31129547035000047302952433967654195398124239844566322884172163637846056248223)
+    aes = pyaes.AESModeOfOperationCTR(getKey(), iv_counter)
+    
+    decrypted = aes.decrypt(enc)
+    return decrypted
+
+def getTenderList():
+    """
+    Fetches all tenders from the Smart Contract.
+    It decrypts the data off-chain and stores it in the 'tenderList' global list.
+    """
+    global tenderList, contract
+    tenderList = []
+    
+    # Call the Solidity function to get the total number of tenders
+    count = contract.functions.getTenderCount().call()
+    
+    for i in range(0, count):
+        # Fetch encrypted data string from blockchain
+        encrypted_data_hex = contract.functions.getTenderDetails(i).call()
+        
+        # Decode Base64 -> Decrypt AES -> Decode Bytes to String
+        encrypted_bytes = base64.b64decode(encrypted_data_hex)
+        decrypted_string = decrypt(encrypted_bytes).decode()
+        
+        tenderList.append(decrypted_string)
+
+# Load tenders when the server starts
+getTenderList()
+
+def getWinner(title):
+    """
+    Checks if a winner has already been declared for a specific tender title.
+    Returns the title if a winner exists, else 'none'.
+    """
+    global tenderList
+    output = 'none'
+    for item in tenderList:
+        arr = item.split("#")
+        # Format: winner#title#amount...
+        if arr[0] == "winner" and arr[1] == title:
+            output = title
+            break
+    return output
+
+def getWinners(title, bidder):
+    """
+    Checks if a specific user (bidder) has won a specific tender.
+    Returns 'Winner' or 'Lost'.
+    """
+    global tenderList
+    output = 'Lost'
+    for item in tenderList:
+        arr = item.split("#")
+        if arr[0] == "winner" and arr[1] == title and arr[4] == bidder:
+            output = "Winner"
+            break
+    return output
+
+# ==========================================
+# 4. DJANGO VIEWS (Frontend Logic)
+# ==========================================
+
+def index(request):
+    """Renders the home page."""
+    return render(request, 'index.html', {})
+
+def Logout(request):
+    """Logs the user out and returns to index."""
+    return render(request, 'index.html', {})
+
+def TenderLogin(request):
+    """Renders the Admin login page."""
+    return render(request, 'TenderLogin.html', {})
+
+def BidderLogin(request):
+    """Renders the Bidder login page."""
+    return render(request, 'BidderLogin.html', {})
+
+def Register(request):
+    """Renders the Registration page."""
+    return render(request, 'Register.html', {})
+
+def CreateTender(request):
+    """Renders the page for Admin to create new tenders."""
+    return render(request, 'CreateTender.html', {})
+
+def TenderLoginAction(request):
+    """
+    Handles Admin Login Logic.
+    Hardcoded admin credentials: admin/admin
+    """
+    if request.method == 'POST':
+        u = request.POST.get('username')
+        p = request.POST.get('password')
+        if u == 'admin' and p == 'admin':
+            return render(request, 'TenderScreen.html', {'data': f'Welcome {u}'})
+        else:
+            return render(request, 'TenderLogin.html', {'data': 'Invalid Login'})
+
+def BidderLoginAction(request):
+    """
+    Handles Bidder Login Logic.
+    Verifies credentials against the data stored on the Blockchain.
+    """
+    global tenderList, username
+    if request.method == 'POST':
+        uname = request.POST.get('username')
+        password = request.POST.get('password')
+        status = 'none'
+        
+        # Iterate through blockchain records to find matching user
+        for item in tenderList:
+            arr = item.split("#")
+            # Format: signup#username#password...
+            if arr[0] == "signup":
+                if arr[1] == uname and arr[2] == password:
+                    status = 'success'
+                    username = uname
+                    break
+        
+        if status == 'success':
+            return render(request, 'BidderScreen.html', {'data': f"Welcome {username}"})
+        else:
+            return render(request, 'BidderLogin.html', {'data': 'Invalid login details'})
+
+def Signup(request):
+    """
+    Registers a new user.
+    Encrypts user details and stores them on the Blockchain.
+    """
+    global tenderList
+    if request.method == 'POST':
+        u = request.POST.get('username')
+        p = request.POST.get('password')
+        contact = request.POST.get('contact')
+        email = request.POST.get('email')
+        cname = request.POST.get('cname')
+        address = request.POST.get('address')
+        
+        # Check if username already exists locally
+        for item in tenderList:
+            arr = item.split("#")
+            if arr[0] == "signup" and arr[1] == u:
+                return render(request, 'Register.html', {'data': 'Username already exists'})
+        
+        # Prepare data string
+        data = f"signup#{u}#{p}#{contact}#{email}#{cname}#{address}"
+        
+        # Encrypt data
+        encrypted = encrypt(data.encode())
+        encrypted_b64 = base64.b64encode(encrypted).decode()
+        
+        # Send transaction to Blockchain
+        tx_hash = contract.functions.createTender(encrypted_b64).transact()
+        receipt = web3.eth.waitForTransactionReceipt(tx_hash)
+        
+        # Update local list
+        tenderList.append(data)
+        return render(request, 'Register.html', {'data': f'Signup details added to Blockchain. TX: {receipt}'})
+
+def CreateTenderAction(request):
+    """
+    Admin function to publish a new tender to the blockchain.
+    """
+    if request.method == 'POST':
+        title = request.POST.get('t1')
+        desc = request.POST.get('t2')
+        open_d = request.POST.get('t3')
+        close_d = request.POST.get('t4')
+        amt = request.POST.get('t5')
+        
+        data = f"tender#{title}#{desc}#{open_d}#{close_d}#{amt}"
+        
+        encrypted = encrypt(data.encode())
+        encrypted_b64 = base64.b64encode(encrypted).decode()
+        
+        tx_hash = contract.functions.createTender(encrypted_b64).transact()
+        receipt = web3.eth.waitForTransactionReceipt(tx_hash)
+        
+        tenderList.append(data)
+        return render(request, 'CreateTender.html', {'data': 'Tender Created Successfully.'})
+
+def BidTender(request):
+    """
+    Displays the list of available tenders for bidders.
+    Checks if the tender is currently open based on dates.
+    """
+    global tenderList
+    output = '<table border=1 align=center>'
+    headers = ['Tender Title', 'Description', 'Open Date', 'Close Date', 'Amount', 'Bid Now']
+    
+    # HTML Table Header
+    output += '<tr>' + ''.join([f'<th><font color="white">{h}</font></th>' for h in headers]) + '</tr>'
+    
+    current_ts = int(datetime.now().timestamp())
+    
+    for item in tenderList:
+        arr = item.split("#")
+        # Check if it is a tender and hasn't been won yet
+        if arr[0] == "tender" and getWinner(arr[1]) == 'none':
+            try:
+                # Parse Dates
+                open_ts = int(datetime.strptime(arr[3], "%d-%m-%Y").timestamp())
+                close_ts = int(datetime.strptime(arr[4], "%d-%m-%Y").timestamp())
+                
+                # Logic: Show tender if current time is within open/close window
+                if current_ts <= open_ts and current_ts <= close_ts:
+                    row = f"""<tr>
+                        <td><font color="white">{arr[1]}</font></td>
+                        <td><font color="white">{arr[2]}</font></td>
+                        <td><font color="white">{arr[3]}</font></td>
+                        <td><font color="white">{arr[4]}</font></td>
+                        <td><font color="white">{arr[5]}</font></td>
+                        <td><a href='BidTenderAction?title={arr[1]}'><font color="white">Click Here</font></a></td>
+                    </tr>"""
+                    output += row
+            except ValueError:
+                continue # Skip invalid dates
+                
+    return render(request, 'BidTender.html', {'data': output})
+
+def BidTenderAction(request):
+    """Renders the bidding form for a specific tender."""
+    title = request.GET.get('title')
+    output = f'<TR><TH align="left"><font color="white">Tender Title</TH><TD><Input type=text name="t1" value="{title}" readonly></TD></TR>'
+    return render(request, 'BidTenderAction.html', {'data1': output})
+
+def BidTenderActionPage(request):
+    """
+    Submits a user's bid to the blockchain.
+    """
+    global username, tenderList
+    if request.method == 'POST':
+        title = request.POST.get('t1')
+        amt = request.POST.get('t2')
+        
+        # Status set to 'Pending' initially
+        data = f"bidding#{title}#{amt}#{username}#Pending"
+        
+        encrypted = encrypt(data.encode())
+        encrypted_b64 = base64.b64encode(encrypted).decode()
+        
+        tx_hash = contract.functions.createTender(encrypted_b64).transact()
+        receipt = web3.eth.waitForTransactionReceipt(tx_hash)
+        
+        tenderList.append(data)
+        return render(request, 'BidderScreen.html', {'data': 'Bidding Submitted Successfully.'})
+
+def ViewTender(request):
+    """Shows the status of tenders (Win/Loss) to the user."""
+    global tenderList
+    output = '<table border=1 align=center><tr><th>Tender Title</th><th>Amount</th><th>Username</th><th>Status</th></tr>'
+    
+    for item in tenderList:
+        arr = item.split("#")
+        if arr[0] == "bidding":
+            status = getWinners(arr[1], arr[3])
+            output += f"<tr><td>{arr[1]}</td><td>{arr[2]}</td><td>{arr[3]}</td><td>{status}</td></tr>"
+            
+    return render(request, 'ViewTender.html', {'data': output})
+
+def EvaluateTender(request):
+    """
+    Admin Feature: Automates the selection of the lowest bidder.
+    1. Finds all pending tenders.
+    2. Calculates the lowest bid amount.
+    3. Records the winner on the blockchain.
+    """
+    global tenderList
+    
+    # 1. Get unique titles of pending tenders
+    pending_titles = []
+    for item in tenderList:
+        arr = item.split("#")
+        if arr[0] == "bidding" and arr[4] == "Pending":
+            if arr[1] not in pending_titles:
+                pending_titles.append(arr[1])
+                
+    # 2. Evaluate lowest bid for each title
+    for title in pending_titles:
+        winner_user = 'none'
+        lowest_bid = float('inf') # Set to infinity initially
+        
+        for item in tenderList:
+            arr = item.split("#")
+            if arr[0] == "bidding" and arr[4] == "Pending" and arr[1] == title:
+                try:
+                    bid_amount = float(arr[2])
+                    if bid_amount < lowest_bid:
+                        lowest_bid = bid_amount
+                        winner_user = arr[3]
+                except ValueError:
+                    continue
+
+        # 3. Publish Winner to Blockchain
+        if winner_user != 'none':
+            if getWinner(title) == 'none': # Only if not already won
+                data = f"winner#{title}#{lowest_bid}#{winner_user}#{winner_user}"
+                
+                encrypted = encrypt(data.encode())
+                encrypted_b64 = base64.b64encode(encrypted).decode()
+                
+                tx_hash = contract.functions.createTender(encrypted_b64).transact()
+                web3.eth.waitForTransactionReceipt(tx_hash)
+                
+                tenderList.append(data)
+                
+    return render(request, 'EvaluateTender.html', {'data': 'Evaluation Process Completed'})
+
+def WinnerSelection(request):
+    """Redirects to ViewTender for the admin to see winners."""
+    return ViewTender(request)
+
+# ==========================================
+# 5. CUSTOM BLOCKCHAIN CLASS (Internal Logic)
+# ==========================================
+# This section defines a pure Python blockchain.
+# Note: This is separate from the Ethereum Web3 logic above.
+
+class Block:
+    def __init__(self, index, transactions, timestamp, previous_hash):
+        self.index = index
+        self.transactions = transactions
+        self.timestamp = timestamp
+        self.previous_hash = previous_hash
+        self.nonce = 0
+        self.hash = None 
+
+    def compute_hash(self):
+        """Returns the hash of the block contents."""
+        block_string = json.dumps(self.__dict__, sort_keys=True)
+        return sha256(block_string.encode()).hexdigest()
+
+class Blockchain:
+    difficulty = 2 # Leading zeros required for Proof of Work
+
+    def __init__(self):
+        self.unconfirmed_transactions = []
+        self.chain = []
+        self.create_genesis_block()
+        self.peer = []
+        self.translist = []
+
+    def create_genesis_block(self):
+        """Creates the very first block in the chain."""
+        genesis_block = Block(0, [], time.time(), "0")
+        genesis_block.hash = genesis_block.compute_hash()
+        self.chain.append(genesis_block)
+
+    @property
+    def last_block(self):
+        return self.chain[-1]
+
+    def add_block(self, block, proof):
+        """Adds a block to the chain after verification."""
+        previous_hash = self.last_block.hash
+        if previous_hash != block.previous_hash:
+            return False
+        if not self.is_valid_proof(block, proof):
+            return False
+        
+        block.hash = proof
+        self.chain.append(block)
+        return True
+
+    def is_valid_proof(self, block, block_hash):
+        """Checks if block_hash is valid (Proof of Work)."""
+        return (block_hash.startswith('0' * Blockchain.difficulty) and
+                block_hash == block.compute_hash())
+
+    def proof_of_work(self, block):
+        """Tries different nonces until the hash meets difficulty criteria."""
+        block.nonce = 0
+        computed_hash = block.compute_hash()
+        while not computed_hash.startswith('0' * Blockchain.difficulty):
+            block.nonce += 1
+            computed_hash = block.compute_hash()
+        return computed_hash
+
+    def add_new_transaction(self, transaction):
+        self.unconfirmed_transactions.append(transaction)
+
+    def addPeer(self, peer_details):
+        self.peer.append(peer_details)     
+    
+    def addTransaction(self, trans_details):
+        self.translist.append(trans_details)
+
+    def mine(self):
+        """Bundles unconfirmed transactions into a new block and mines it."""
+        if not self.unconfirmed_transactions:
+            return False
+        
+        last_block = self.last_block
+        new_block = Block(index=last_block.index + 1,
+                          transactions=self.unconfirmed_transactions,
+                          timestamp=time.time(),
+                          previous_hash=last_block.hash)
+        
+        proof = self.proof_of_work(new_block)
+        self.add_block(new_block, proof)
+        self.unconfirmed_transactions = []
+        return new_block.index
+
+    def save_object(self, obj, filename):
+        with open(filename, 'wb') as output:
+            pickle.dump(obj, output, pickle.HIGHEST_PROTOCOL)
